@@ -1,2070 +1,1130 @@
-// Google Find My Device Card for Home Assistant
-// Version: 1.1.0 - Stable release: Fixed preview display, card rendering, and map initialization
+/*!
+ * Google FindMy Card Tracker
+ * A Home Assistant Lovelace card for Google Find My Device / device_tracker entities.
+ * Adds route playback, start/end + numbered markers, direction arrows,
+ * trip statistics and GPX/KML export on top of an interactive Leaflet map.
+ *
+ * Repository: https://github.com/davicho16/googlefindmy-card-tracker
+ * License: MIT
+ */
+(() => {
+  "use strict";
 
-import {
-  LitElement,
-  html,
-  css,
-} from "https://unpkg.com/lit-element@2.5.1/lit-element.js?module";
+  const CARD_VERSION = "1.0.1";
+  const CARD_TAG = "googlefindmy-card-tracker";
+  const EDITOR_TAG = "googlefindmy-card-tracker-editor";
 
-// Load Leaflet.js for interactive maps
-const loadLeaflet = () => {
-  if (window.L) return Promise.resolve();
+  const LEAFLET_JS = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+  const LEAFLET_CSS = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+  const DECORATOR_JS =
+    "https://unpkg.com/leaflet-polylinedecorator@1.6.0/dist/leaflet.polylineDecorator.js";
 
-  return new Promise((resolve, reject) => {
-    // Load CSS
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-    document.head.appendChild(link);
-
-    // Load JS
-    const script = document.createElement('script');
-    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-    script.onload = resolve;
-    script.onerror = reject;
-    document.head.appendChild(script);
-  });
-};
-
-class GoogleFindMyCard extends LitElement {
-  static get properties() {
-    return {
-      config: { type: Object },
-      _selectedDevice: { type: String },
-      _showDeviceList: { type: Boolean },
-      _leafletLoaded: { type: Boolean },
-      _locationHistory: { type: Array },
-      _historyDays: { type: Number },
-      _accuracyFilter: { type: Number },
-      _showFilters: { type: Boolean },
-      _markerOpacity: { type: Number },
-    };
+  const _scriptPromises = {};
+  function loadScriptOnce(src) {
+    if (_scriptPromises[src]) return _scriptPromises[src];
+    _scriptPromises[src] = new Promise((resolve, reject) => {
+      if (document.querySelector(`script[data-gfm-src="${src}"]`)) {
+        resolve();
+        return;
+      }
+      const el = document.createElement("script");
+      el.src = src;
+      el.async = true;
+      el.dataset.gfmSrc = src;
+      el.onload = () => resolve();
+      el.onerror = () => reject(new Error(`No se pudo cargar ${src}`));
+      document.head.appendChild(el);
+    });
+    return _scriptPromises[src];
   }
 
-  constructor() {
-    super();
-    this._selectedDevice = null;
-    this._showDeviceList = false;
-    this._mapInstance = null;
-    this._mapContainer = null;
-    this._leafletLoaded = false;
-    this._locationHistory = [];
+  function loadCSSOnce(href) {
+    if (document.querySelector(`link[data-gfm-href="${href}"]`)) return;
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = href;
+    link.dataset.gfmHref = href;
+    document.head.appendChild(link);
+  }
 
-    // Load filter settings from localStorage with defaults
-    const savedSettings = this._loadFilterSettings();
-    this._historyDays = savedSettings.historyDays;
-    this._accuracyFilter = savedSettings.accuracyFilter;
-    this._markerOpacity = savedSettings.markerOpacity;
-    this._showFilters = false;
-    this._hass = null;
+  async function ensureLeaflet() {
+    loadCSSOnce(LEAFLET_CSS);
+    if (!window.L) {
+      await loadScriptOnce(LEAFLET_JS);
+    }
+    if (!window.L.Symbol) {
+      try {
+        await loadScriptOnce(DECORATOR_JS);
+      } catch (e) {
+        console.warn("[googlefindmy-card-tracker] leaflet-polylinedecorator no disponible:", e);
+      }
+    }
+    return window.L;
+  }
 
-    // Bind resize handler
-    this._handleResize = this._handleResize.bind(this);
+  function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
 
-    // Load Leaflet library
-    console.log('[GoogleFindMy] Loading Leaflet.js...');
-    loadLeaflet().then(() => {
-      this._leafletLoaded = true;
-      console.log('[GoogleFindMy] Leaflet loaded successfully:', !!window.L);
-      this.requestUpdate();
-    }).catch(err => {
-      console.error('[GoogleFindMy] Failed to load Leaflet:', err);
+  function bearingDegrees(lat1, lon1, lat2, lon2) {
+    const toRad = (d) => (d * Math.PI) / 180;
+    const toDeg = (r) => (r * 180) / Math.PI;
+    const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+    const x =
+      Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+      Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+    return (toDeg(Math.atan2(y, x)) + 360) % 360;
+  }
+
+  function escapeXML(str) {
+    return String(str ?? "").replace(/[<>&'"]/g, (c) => {
+      switch (c) {
+        case "<":
+          return "&lt;";
+        case ">":
+          return "&gt;";
+        case "&":
+          return "&amp;";
+        case "'":
+          return "&apos;";
+        case '"':
+          return "&quot;";
+        default:
+          return c;
+      }
     });
   }
 
-  _loadFilterSettings() {
-    try {
-      const saved = localStorage.getItem('googlefindmy-filter-settings');
-      if (saved) {
-        const settings = JSON.parse(saved);
-        return {
-          historyDays: settings.historyDays || 3,
-          accuracyFilter: settings.accuracyFilter || 0,
-          markerOpacity: settings.markerOpacity || 100
-        };
-      }
-    } catch (err) {
-      console.warn('[GoogleFindMy] Failed to load filter settings:', err);
-    }
-    // Return defaults
-    return {
-      historyDays: 3,
-      accuracyFilter: 0,
-      markerOpacity: 100
-    };
+  function escapeHTML(str) {
+    const div = document.createElement("div");
+    div.textContent = String(str ?? "");
+    return div.innerHTML;
   }
 
-  _saveFilterSettings() {
-    try {
-      const settings = {
-        historyDays: this._historyDays,
-        accuracyFilter: this._accuracyFilter,
-        markerOpacity: this._markerOpacity
+  function downloadFile(filename, content, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function formatDuration(ms) {
+    if (!ms || ms < 0) return "0 min";
+    const totalMin = Math.round(ms / 60000);
+    const days = Math.floor(totalMin / 1440);
+    const hours = Math.floor((totalMin % 1440) / 60);
+    const min = totalMin % 60;
+    const parts = [];
+    if (days) parts.push(`${days}d`);
+    if (hours) parts.push(`${hours}h`);
+    if (min || parts.length === 0) parts.push(`${min}min`);
+    return parts.join(" ");
+  }
+
+  function formatDistance(km) {
+    if (km < 1) return `${Math.round(km * 1000)} m`;
+    return `${km.toFixed(2)} km`;
+  }
+
+  function formatTime(date) {
+    if (!date) return "-";
+    return date.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function buildGPX(points, name) {
+    const trkpts = points
+      .map((p) => {
+        const ext =
+          p.accuracy != null
+            ? `      <extensions><gfm:accuracy xmlns:gfm="https://github.com/davicho16/googlefindmy-card-tracker">${p.accuracy}</gfm:accuracy></extensions>\n`
+            : "";
+        return `    <trkpt lat="${p.lat}" lon="${p.lon}">\n      <time>${p.timestamp.toISOString()}</time>\n${ext}    </trkpt>`;
+      })
+      .join("\n");
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="googlefindmy-card-tracker ${CARD_VERSION}" xmlns="http://www.topografix.com/GPX/1/1">\n  <metadata>\n    <name>${escapeXML(
+      name
+    )}</name>\n    <time>${new Date().toISOString()}</time>\n  </metadata>\n  <trk>\n    <name>${escapeXML(
+      name
+    )}</name>\n    <trkseg>\n${trkpts}\n    </trkseg>\n  </trk>\n</gpx>\n`;
+  }
+
+  function buildKML(points, name) {
+    const coords = points.map((p) => `${p.lon},${p.lat},0`).join(" ");
+    const placemarks = points
+      .map((p, i) => {
+        const isStart = i === 0;
+        const isEnd = i === points.length - 1;
+        const label = isStart ? "Inicio" : isEnd ? "Fin" : `Punto ${i}`;
+        return `    <Placemark>\n      <name>${escapeXML(label)}</name>\n      <TimeStamp><when>${p.timestamp.toISOString()}</when></TimeStamp>\n      <description>Precisión: ${
+          p.accuracy != null ? Math.round(p.accuracy) + " m" : "N/D"
+        }</description>\n      <Point><coordinates>${p.lon},${p.lat},0</coordinates></Point>\n    </Placemark>`;
+      })
+      .join("\n");
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n  <Document>\n    <name>${escapeXML(
+      name
+    )}</name>\n    <Style id="gfmLine">\n      <LineStyle><color>ff2196f3</color><width>4</width></LineStyle>\n    </Style>\n    <Placemark>\n      <name>${escapeXML(
+      name
+    )} - Recorrido</name>\n      <styleUrl>#gfmLine</styleUrl>\n      <LineString>\n        <tessellate>1</tessellate>\n        <coordinates>${coords}</coordinates>\n      </LineString>\n    </Placemark>\n${placemarks}\n  </Document>\n</kml>\n`;
+  }
+
+  function computeStats(points) {
+    if (!points || points.length === 0) {
+      return { distanceKm: 0, durationMs: 0, avgSpeed: 0, maxSpeed: 0, count: 0, start: null, end: null };
+    }
+    if (points.length === 1) {
+      return {
+        distanceKm: 0,
+        durationMs: 0,
+        avgSpeed: 0,
+        maxSpeed: 0,
+        count: 1,
+        start: points[0].timestamp,
+        end: points[0].timestamp,
       };
-      localStorage.setItem('googlefindmy-filter-settings', JSON.stringify(settings));
-    } catch (err) {
-      console.warn('[GoogleFindMy] Failed to save filter settings:', err);
     }
-  }
-
-  set hass(value) {
-    const oldHass = this._hass;
-    this._hass = value;
-
-    // Only update map if coordinates changed
-    if (oldHass && this._leafletLoaded && this._selectedDevice) {
-      const devices = this._getDevices();
-      const selectedDevice = devices.find(d => d.entity_id === this._selectedDevice) || devices[0];
-      if (selectedDevice) {
-        const oldEntity = oldHass.states[selectedDevice.entity_id];
-        const newEntity = value.states[selectedDevice.entity_id];
-
-        if (oldEntity && newEntity &&
-            (oldEntity.attributes.latitude !== newEntity.attributes.latitude ||
-             oldEntity.attributes.longitude !== newEntity.attributes.longitude)) {
-          this._updateMap();
-        }
+    let distance = 0;
+    let maxSpeed = 0;
+    for (let i = 1; i < points.length; i++) {
+      const d = haversineMeters(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+      distance += d;
+      const dtHours = (points[i].timestamp - points[i - 1].timestamp) / 3600000;
+      if (dtHours > 0) {
+        const speed = d / 1000 / dtHours;
+        if (speed > maxSpeed && speed < 300) maxSpeed = speed;
       }
     }
-  }
-
-  get hass() {
-    return this._hass;
-  }
-
-  updated(changedProperties) {
-    super.updated(changedProperties);
-    if (changedProperties.has('config') && this.config) {
-      // Set initial device list state based on config
-      if (this.config.keep_device_list_pinned) {
-        this._showDeviceList = true;
-      }
-    }
-
-    // Initialize or update map when Leaflet loads or selected device changes
-    if ((changedProperties.has('_leafletLoaded') || changedProperties.has('_selectedDevice')) && this._leafletLoaded) {
-      // Only update map if we have hass and devices
-      const devices = this.hass ? this._getDevices() : [];
-      const selectedDevice = this._selectedDevice ?
-        devices.find(d => d.entity_id === this._selectedDevice) :
-        devices[0];
-
-      if (this.hass && selectedDevice && this.hass.states[selectedDevice.entity_id]) {
-        // Fetch new history when device changes
-        if (changedProperties.has('_selectedDevice') && this._selectedDevice) {
-          this._fetchLocationHistory();
-        }
-        this._updateMap();
-      }
-    }
-  }
-
-  connectedCallback() {
-    super.connectedCallback();
-    // Add resize listener
-    window.addEventListener('resize', this._handleResize);
-  }
-
-  disconnectedCallback() {
-    super.disconnectedCallback();
-    // Remove resize listener
-    window.removeEventListener('resize', this._handleResize);
-    // Clean up map instance
-    if (this._mapInstance) {
-      this._mapInstance.remove();
-      this._mapInstance = null;
-    }
-  }
-
-  _handleResize() {
-    // Invalidate map size when window resizes
-    if (this._mapInstance) {
-      setTimeout(() => {
-        if (this._mapInstance) {
-          this._mapInstance.invalidateSize();
-        }
-      }, 100);
-    }
-  }
-
-
-  static get styles() {
-    return css`
-      :host {
-        display: flex;
-        flex-direction: column;
-        font-family: 'Google Sans', 'Roboto', sans-serif;
-        height: 100%;
-        overflow: hidden;
-      }
-
-      /* Lower z-index for edit mode compatibility */
-      .card-header,
-      .device-sidebar {
-        z-index: 1 !important;
-      }
-
-      ha-card {
-        min-height: 400px;
-        height: 100%;
-        max-height: 100vh;
-        display: flex;
-        width: 100%;
-        flex-direction: column;
-        overflow: hidden;
-        padding: 0;
-        box-sizing: border-box;
-        background: #ffffff;
-        border: none;
-        border-radius: 16px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-      }
-
-      .card-header {
-        position: absolute;
-        top: 10px;
-        left: 12px;
-        right: 12px;
-        z-index: 1;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        background: rgba(255, 255, 255, 0.95);
-        backdrop-filter: blur(10px);
-        border-radius: 8px;
-        padding: 8px 12px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        height: 60px;
-        box-sizing: border-box;
-      }
-
-      .card-title {
-        font-size: 18px;
-        font-weight: 500;
-        color: #202124;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        font-family: 'Google Sans', sans-serif;
-      }
-
-      .card-icon {
-        width: 24px;
-        height: 24px;
-        color: #1a73e8;
-        margin-right: 8px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-
-      .control-buttons {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-      }
-
-      .control-button {
-        width: 36px;
-        height: 36px;
-        border-radius: 18px;
-        background: #ffffff;
-        border: 1px solid #dadce0;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transition: all 0.2s ease;
-        color: #5f6368;
-        position: relative;
-      }
-
-      .control-button:hover {
-        background: #f8f9fa;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-      }
-
-      .control-button.active {
-        background: #1a73e8;
-        color: white;
-        border-color: #1a73e8;
-      }
-
-      .control-button ha-icon {
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        --mdc-icon-size: 20px;
-        width: 20px;
-        height: 20px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-
-      .map-container {
-        flex: 1 1 0;
-        width: 100%;
-        min-height: 0;
-        position: relative;
-        background: #f8f9fa;
-        overflow: hidden;
-      }
-
-      .map-iframe {
-        width: 100%;
-        height: 100%;
-        border: none;
-      }
-
-      /* Leaflet map container */
-      #leaflet-map {
-        width: 100%;
-        height: 100%;
-        z-index: 0;
-      }
-
-      /* Critical Leaflet CSS - required for proper tile positioning */
-      #leaflet-map .leaflet-pane,
-      #leaflet-map .leaflet-tile,
-      #leaflet-map .leaflet-marker-icon,
-      #leaflet-map .leaflet-marker-shadow,
-      #leaflet-map .leaflet-tile-container,
-      #leaflet-map .leaflet-pane > svg,
-      #leaflet-map .leaflet-pane > canvas,
-      #leaflet-map .leaflet-zoom-box,
-      #leaflet-map .leaflet-image-layer,
-      #leaflet-map .leaflet-layer {
-        position: absolute;
-        left: 0;
-        top: 0;
-      }
-
-      .leaflet-container {
-        overflow: hidden;
-        font-family: 'Google Sans', 'Roboto', sans-serif;
-      }
-
-      .leaflet-tile,
-      .leaflet-marker-icon,
-      .leaflet-marker-shadow {
-        user-select: none;
-        -webkit-user-drag: none;
-      }
-
-      .leaflet-tile {
-        filter: inherit;
-        visibility: hidden;
-      }
-
-      .leaflet-tile-loaded {
-        visibility: inherit;
-      }
-
-      .leaflet-container .leaflet-overlay-pane svg {
-        max-width: none !important;
-        max-height: none !important;
-      }
-
-      .leaflet-container .leaflet-marker-pane img,
-      .leaflet-container .leaflet-shadow-pane img,
-      .leaflet-container .leaflet-tile-pane img,
-      .leaflet-container img.leaflet-image-layer,
-      .leaflet-container .leaflet-tile {
-        max-width: none !important;
-        max-height: none !important;
-        width: auto;
-        padding: 0;
-      }
-
-      .leaflet-overlay-pane svg {
-        user-select: none;
-      }
-
-      .leaflet-pane {
-        z-index: 400;
-      }
-
-      .leaflet-tile-pane {
-        z-index: 200;
-      }
-
-      .leaflet-overlay-pane {
-        z-index: 400;
-      }
-
-      .leaflet-shadow-pane {
-        z-index: 500;
-      }
-
-      .leaflet-marker-pane {
-        z-index: 600;
-      }
-
-      .leaflet-tooltip-pane {
-        z-index: 650;
-      }
-
-      .leaflet-pane > svg path,
-      .leaflet-tile-container {
-        pointer-events: none;
-      }
-
-      .leaflet-pane > svg path.leaflet-interactive,
-      svg.leaflet-image-layer.leaflet-interactive path {
-        pointer-events: auto;
-      }
-
-      .leaflet-container.leaflet-touch-zoom {
-        touch-action: pan-x pan-y;
-      }
-
-      .leaflet-container.leaflet-touch-drag {
-        touch-action: pinch-zoom;
-      }
-
-      .leaflet-container.leaflet-touch-drag.leaflet-touch-zoom {
-        touch-action: none;
-      }
-
-      /* Leaflet controls */
-      .leaflet-control {
-        position: relative;
-        z-index: 800;
-        pointer-events: visiblePainted;
-        pointer-events: auto;
-      }
-
-      .leaflet-top,
-      .leaflet-bottom {
-        position: absolute;
-        z-index: 1000;
-        pointer-events: none;
-      }
-
-      .leaflet-top {
-        top: 0;
-      }
-
-      .leaflet-right {
-        right: 0;
-      }
-
-      .leaflet-bottom {
-        bottom: 0;
-      }
-
-      .leaflet-left {
-        left: 0;
-      }
-
-      .leaflet-control {
-        float: left;
-        clear: both;
-      }
-
-      .leaflet-right .leaflet-control {
-        float: right;
-      }
-
-      .leaflet-top .leaflet-control {
-        margin-top: 10px;
-      }
-
-      .leaflet-bottom .leaflet-control {
-        margin-bottom: 10px;
-      }
-
-      .leaflet-left .leaflet-control {
-        margin-left: 10px;
-      }
-
-      .leaflet-right .leaflet-control {
-        margin-right: 10px;
-      }
-
-      /* Move zoom control to bottom-right */
-      .leaflet-top.leaflet-left {
-        top: auto;
-        bottom: 12px;
-        left: auto;
-        right: 12px;
-      }
-
-      /* Move attribution to bottom-center */
-      .leaflet-control-attribution {
-        position: absolute;
-        bottom: 0;
-        left: 50%;
-        transform: translateX(-50%);
-        background: rgba(255, 255, 255, 0.8);
-        padding: 0 8px;
-        font-size: 11px;
-        text-align: center;
-        margin: 0 !important;
-      }
-
-      .leaflet-bottom.leaflet-right {
-        bottom: 0;
-        left: 0;
-        right: 0;
-        text-align: center;
-        pointer-events: none;
-      }
-
-      .leaflet-bottom.leaflet-right .leaflet-control {
-        float: none;
-        display: inline-block;
-        pointer-events: auto;
-      }
-
-      /* Zoom control */
-      .leaflet-bar {
-        box-shadow: 0 1px 5px rgba(0,0,0,0.65);
-        border-radius: 4px;
-      }
-
-      .leaflet-bar a {
-        background-color: #fff;
-        border-bottom: 1px solid #ccc;
-        width: 26px;
-        height: 26px;
-        line-height: 26px;
-        display: block;
-        text-align: center;
-        text-decoration: none;
-        color: black;
-      }
-
-      .leaflet-bar a:hover {
-        background-color: #f4f4f4;
-      }
-
-      .leaflet-bar a:first-child {
-        border-top-left-radius: 4px;
-        border-top-right-radius: 4px;
-      }
-
-      .leaflet-bar a:last-child {
-        border-bottom-left-radius: 4px;
-        border-bottom-right-radius: 4px;
-        border-bottom: none;
-      }
-
-      .leaflet-bar a.leaflet-disabled {
-        cursor: default;
-        background-color: #f4f4f4;
-        color: #bbb;
-      }
-
-      .leaflet-touch .leaflet-bar a {
-        width: 30px;
-        height: 30px;
-        line-height: 30px;
-      }
-
-      .leaflet-control-zoom-in,
-      .leaflet-control-zoom-out {
-        font: bold 18px 'Lucida Console', Monaco, monospace;
-        text-indent: 1px;
-      }
-
-      .leaflet-touch .leaflet-control-zoom-in,
-      .leaflet-touch .leaflet-control-zoom-out {
-        font-size: 22px;
-      }
-
-      .leaflet-popup-content-wrapper {
-        border-radius: 12px;
-        background: #ffffff;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-        border: 1px solid #e8eaed;
-      }
-
-      .leaflet-popup-content {
-        margin: 12px;
-        font-size: 13px;
-        font-family: 'Google Sans', 'Roboto', sans-serif;
-        color: #202124;
-      }
-
-      .leaflet-popup-tip {
-        background: #ffffff;
-        border: 1px solid #e8eaed;
-      }
-
-      /* Filter panel for map controls */
-      .filter-panel {
-        position: absolute;
-        top: 80px;
-        right: 12px;
-        z-index: 1000;
-        background: rgba(255, 255, 255, 0.95);
-        backdrop-filter: blur(10px);
-        padding: 12px;
-        border-radius: 12px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        max-width: 300px;
-        font-size: 13px;
-      }
-
-      .filter-panel.collapsed {
-        padding: 8px;
-      }
-
-      .filter-panel.collapsed .filter-content {
-        display: none;
-      }
-
-      .filter-toggle {
-        background: #1a73e8;
-        color: white;
-        border: none;
-        padding: 8px 16px;
-        border-radius: 8px;
-        cursor: pointer;
-        font-size: 13px;
-        font-weight: 500;
-        width: 100%;
-      }
-
-      .filter-toggle:hover {
-        background: #1557b0;
-      }
-
-      .filter-content {
-        margin-top: 12px;
-      }
-
-      .filter-section {
-        margin: 12px 0;
-        padding-bottom: 12px;
-        border-bottom: 1px solid #e0e0e0;
-      }
-
-      .filter-section:last-child {
-        border-bottom: none;
-      }
-
-      .filter-label {
-        font-weight: 500;
-        margin-bottom: 8px;
-        display: block;
-      }
-
-      .time-range-buttons {
-        display: flex;
-        gap: 4px;
-        flex-wrap: wrap;
-      }
-
-      .time-range-btn {
-        background: #f1f3f4;
-        border: none;
-        padding: 6px 12px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 12px;
-        flex: 1;
-        min-width: 50px;
-      }
-
-      .time-range-btn.active {
-        background: #1a73e8;
-        color: white;
-      }
-
-      .time-range-btn:hover {
-        background: #e8eaed;
-      }
-
-      .time-range-btn.active:hover {
-        background: #1557b0;
-      }
-
-      .accuracy-slider-container {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .accuracy-slider {
-        flex: 1;
-        height: 6px;
-        border-radius: 3px;
-        outline: none;
-        cursor: pointer;
-      }
-
-      .accuracy-value {
-        min-width: 60px;
-        font-weight: 500;
-        color: #1a73e8;
-        font-size: 12px;
-      }
-
-      .device-sidebar {
-        position: absolute;
-        left: 12px;
-        top: 80px;
-        bottom: 12px;
-        width: 200px;
-        background: rgba(255, 255, 255, 0.95);
-        backdrop-filter: blur(10px);
-        border-radius: 12px;
-        padding: 16px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        z-index: 1;
-        overflow-y: auto;
-        transform: translateX(-340px);
-        transition: transform 0.3s ease;
-      }
-
-      .device-sidebar.open {
-        transform: translateX(0);
-      }
-
-      .device-list {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
-
-      .device-card {
-        background: #ffffff;
-        border-radius: 12px;
-        border: 1px solid #e8eaed;
-        padding: 12px 16px;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        min-height: 44px;
-        -webkit-tap-highlight-color: rgba(0,0,0,0.1);
-      }
-
-      .device-card:hover {
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-      }
-
-      .device-card.selected {
-        border-color: #1a73e8;
-        box-shadow: 0 2px 8px rgba(26, 115, 232, 0.2);
-      }
-
-      .device-header {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        margin-bottom: 6px;
-      }
-
-      .device-icon {
-        width: 28px;
-        height: 28px;
-        color: #1a73e8;
-        flex-shrink: 0;
-      }
-
-      .device-info {
-        flex: 1;
-        min-width: 0;
-      }
-
-      .device-name {
-        font-size: 16px;
-        font-weight: 500;
-        color: #202124;
-        margin-bottom: 2px;
-        font-family: 'Google Sans', sans-serif;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-
-
-      .location-icon {
-        width: 16px;
-        height: 16px;
-      }
-
-      .device-status {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 12px;
-        color: #5f6368;
-      }
-
-      .status-dot {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        flex-shrink: 0;
-      }
-
-      .status-dot.online {
-        background: #34a853;
-      }
-
-      .status-dot.offline {
-        background: #ea4335;
-      }
-
-      .status-dot.unknown {
-        background: #fbbc04;
-      }
-
-      .device-location {
-        font-size: 12px;
-        color: #5f6368;
-        margin-top: 4px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-
-      .last-seen {
-        font-size: 11px;
-        color: #9aa0a6;
-        margin-top: 2px;
-      }
-
-      .device-actions {
-        display: flex;
-        gap: 8px;
-        margin-top: 12px;
-        flex-wrap: wrap;
-      }
-
-      .action-button {
-        width: auto;
-        height: 20px;
-        padding: 0 6px;
-        background: #1a73e8;
-        color: white;
-        border: none;
-        border-radius: 10px;
-        font-size: 9px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 2px;
-        font-family: 'Google Sans', sans-serif;
-      }
-
-      .action-button:hover {
-        background: #1557b0;
-      }
-
-      .action-button.secondary {
-        background: #ffffff;
-        color: #1a73e8;
-        border: 1px solid #dadce0;
-      }
-
-      .action-button.secondary:hover {
-        background: #f8f9fa;
-      }
-
-      .no-devices {
-        text-align: center;
-        padding: 48px 24px;
-        color: #5f6368;
-        background: rgba(255, 255, 255, 0.95);
-        backdrop-filter: blur(10px);
-        border-radius: 12px;
-        margin: 80px 16px 16px 16px;
-      }
-
-      /* Mobile responsive adjustments */
-      @media (max-width: 768px) {
-        .card-header {
-          top: 8px;
-          left: 8px;
-          right: 8px;
-          padding: 8px;
-        }
-
-        .card-title {
-          font-size: 16px;
-        }
-
-        .control-button {
-          width: 32px;
-          height: 32px;
-        }
-
-        .device-sidebar {
-          width: 180px;
-          top: 80px;
-          padding: 12px;
-          transform: translateX(-220px);
-        }
-
-        .filter-panel {
-          top: 80px;
-          right: 8px;
-          max-width: 250px;
-          font-size: 12px;
-        }
-
-        .device-card {
-          padding: 10px 12px;
-        }
-
-        .device-name {
-          font-size: 14px;
-        }
-      }
-
-      @media (max-width: 768px) {
-        .card-header {
-          top: 8px !important;
-          left: 8px !important;
-          right: 8px !important;
-          padding: 6px !important;
-          height: 60px !important;
-        }
-
-        .card-title {
-          font-size: 14px !important;
-        }
-
-        .device-sidebar {
-          width: 150px !important;
-          max-width: 150px !important;
-          left: 8px !important;
-          right: auto !important;
-          top: 80px !important;
-          padding: 8px !important;
-          transform: translateX(-166px) !important;
-        }
-
-        .device-sidebar.open {
-          transform: translateX(0) !important;
-          width: 150px !important;
-          max-width: 150px !important;
-          right: auto !important;
-        }
-
-        .device-list {
-          gap: 8px !important;
-        }
-
-        .device-card {
-          padding: 8px 12px !important;
-          min-height: auto !important;
-          border-radius: 8px !important;
-        }
-
-        .device-header {
-          display: block !important;
-          margin-bottom: 0 !important;
-        }
-
-        .device-icon {
-          display: none !important;
-          visibility: hidden !important;
-          width: 0 !important;
-          height: 0 !important;
-          opacity: 0 !important;
-        }
-
-        .device-info {
-          width: 100% !important;
-        }
-
-        .device-name {
-          font-size: 13px !important;
-          font-weight: 500 !important;
-          line-height: 1.3 !important;
-          margin-bottom: 4px !important;
-        }
-
-        .device-status {
-          display: flex !important;
-          align-items: center !important;
-          gap: 6px !important;
-          font-size: 11px !important;
-          color: #5f6368 !important;
-        }
-
-        .status-dot {
-          width: 6px !important;
-          height: 6px !important;
-        }
-
-        .device-location {
-          display: none !important;
-        }
-
-        .filter-panel {
-          top: 80px !important;
-          right: 8px !important;
-          max-width: 200px !important;
-        }
-
-        .filter-panel.collapsed {
-          top: 80px !important;
-        }
-      }
-    `;
-  }
-
-  setConfig(config) {
-    // Accept empty or missing entities array
-    const entities = Array.isArray(config?.entities) ? config.entities : [];
-
-    this.config = {
-      title: "Find My Devices",
-      show_last_seen: true,
-      show_location_name: true,
-      show_coordinates: true,
-      enable_actions: false,
-      compact_mode: false,
-      keep_device_list_pinned: false,
-      show_path_lines: false,
-      use_leaflet_map: true,
-      ...config,
-      entities, // Override with validated entities array
+    const durationMs = points[points.length - 1].timestamp - points[0].timestamp;
+    const durationHours = durationMs / 3600000;
+    const avgSpeed = durationHours > 0 ? distance / 1000 / durationHours : 0;
+    return {
+      distanceKm: distance / 1000,
+      durationMs,
+      avgSpeed,
+      maxSpeed,
+      count: points.length,
+      start: points[0].timestamp,
+      end: points[points.length - 1].timestamp,
     };
   }
 
-  render() {
-    try {
-      if (!this.config) {
-        return html`<ha-card><p>Loading configuration...</p></ha-card>`;
+  const DEFAULT_CONFIG = {
+    title: "Find My Devices",
+    entities: [],
+    show_last_seen: true,
+    show_location_name: true,
+    enable_actions: true,
+    keep_device_list_pinned: false,
+    show_path_lines: true,
+    filter_keywords: "",
+    history_days: 3,
+    accuracy_filter: 0,
+    show_start_end_markers: true,
+    show_numbered_markers: true,
+    show_direction_arrows: true,
+    enable_playback: true,
+    show_statistics: true,
+    enable_export: true,
+  };
+
+  class GoogleFindMyCardTracker extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: "open" });
+      this._config = null;
+      this._hass = null;
+      this._built = false;
+      this._map = null;
+      this._layerGroup = null;
+      this._decorator = null;
+      this._selectedEntityId = null;
+      this._points = [];
+      this._panelState = { devices: false, filters: false, stats: false, playback: false };
+      this._runtimeFilters = { days: 3, accuracy: 0 };
+      this._playback = {
+        timer: null,
+        index: 0,
+        speed: 1,
+        playing: false,
+        marker: null,
+      };
+    }
+
+    setConfig(config) {
+      if (!config || !Array.isArray(config.entities) || config.entities.length === 0) {
+        throw new Error("Debes definir al menos una entidad en 'entities'.");
       }
+      this._config = { ...DEFAULT_CONFIG, ...config };
+      this._runtimeFilters.days = this._config.history_days;
+      this._runtimeFilters.accuracy = this._config.accuracy_filter;
+      if (this._built) {
+        this._renderShell();
+      }
+    }
 
-      const devices = this.hass ? this._getDevices() : [];
+    getCardSize() {
+      return 7;
+    }
 
-      return html`
+    static getConfigElement() {
+      return document.createElement(EDITOR_TAG);
+    }
+
+    static getStubConfig() {
+      return { entities: [] };
+    }
+
+    set hass(hass) {
+      const first = !this._hass;
+      this._hass = hass;
+      if (!this._built) {
+        this._build();
+      }
+      this._updateDeviceList();
+      if (first && this._config.entities.length > 0) {
+        const first_entity = this._resolveEntities()[0];
+        if (first_entity) this._selectDevice(first_entity.entity, true);
+      }
+    }
+
+    get hass() {
+      return this._hass;
+    }
+
+    connectedCallback() {
+      if (this._hass && !this._built) this._build();
+    }
+
+    disconnectedCallback() {
+      this._stopPlayback();
+      if (this._resizeObserver) {
+        this._resizeObserver.disconnect();
+        this._resizeObserver = null;
+      }
+    }
+
+    async _build() {
+      this._built = true;
+      this._renderShell();
+      try {
+        await ensureLeaflet();
+        this._initMap();
+      } catch (e) {
+        console.error("[googlefindmy-card-tracker] Error cargando Leaflet:", e);
+        const mapEl = this.shadowRoot.getElementById("gfm-map");
+        if (mapEl) mapEl.innerHTML = `<div class="gfm-error">No se pudo cargar el mapa: ${escapeHTML(e.message)}</div>`;
+      }
+    }
+
+    _resolveEntities() {
+      const keywords = (this._config.filter_keywords || "")
+        .split(",")
+        .map((k) => k.trim().toLowerCase())
+        .filter(Boolean);
+
+      return this._config.entities
+        .map((e) => (typeof e === "string" ? { entity: e } : e))
+        .filter((e) => {
+          if (keywords.length === 0) return true;
+          return keywords.some((k) => e.entity.toLowerCase().includes(k));
+        });
+    }
+
+    _renderShell() {
+      const root = this.shadowRoot;
+      root.innerHTML = `
+        <style>${this._styles()}</style>
         <ha-card>
-          <div class="card-header">
-            <div class="card-title">
-              <ha-icon class="card-icon" icon="mdi:google-maps"></ha-icon>
-              ${this.config.title || "Find My Devices"}
+          <div class="gfm-header">
+            <div class="gfm-title">${escapeHTML(this._config.title)}</div>
+            <div class="gfm-header-actions">
+              <button id="gfm-btn-devices" class="gfm-icon-btn" title="Dispositivos">📱</button>
+              <button id="gfm-btn-filters" class="gfm-icon-btn" title="Filtros">📅</button>
+              ${this._config.show_statistics ? '<button id="gfm-btn-stats" class="gfm-icon-btn" title="Estadísticas">📊</button>' : ""}
+              ${this._config.enable_playback ? '<button id="gfm-btn-playback" class="gfm-icon-btn" title="Reproducir recorrido">🎞️</button>' : ""}
+              <button id="gfm-btn-refresh" class="gfm-icon-btn" title="Actualizar">🔄</button>
             </div>
-            <div class="control-buttons">
-              <div class="control-button ${this._showDeviceList ? 'active' : ''}"
-                   @click=${this._toggleDeviceList}
-                   title="${this.config.keep_device_list_pinned ? 'Device list pinned' : 'Toggle device list'}">
-                <ha-icon icon="${this.config.keep_device_list_pinned ? 'mdi:pin' : 'mdi:format-list-bulleted'}"></ha-icon>
+          </div>
+          <div class="gfm-body">
+            <div id="gfm-devices" class="gfm-devices ${this._config.keep_device_list_pinned ? "gfm-pinned" : ""}"></div>
+            <div class="gfm-map-wrap">
+              <div id="gfm-map" class="gfm-map"></div>
+
+              <div id="gfm-filters-panel" class="gfm-panel gfm-panel-topright">
+                <div class="gfm-panel-title">📅 Filtros</div>
+                <div class="gfm-field">
+                  <label>Rango histórico</label>
+                  <div class="gfm-btn-row">
+                    <button data-days="1" class="gfm-chip">1d</button>
+                    <button data-days="3" class="gfm-chip">3d</button>
+                    <button data-days="7" class="gfm-chip">7d</button>
+                    <button data-days="14" class="gfm-chip">14d</button>
+                  </div>
+                </div>
+                <div class="gfm-field">
+                  <label>Precisión GPS máx: <span id="gfm-accuracy-val">0 m (desactivado)</span></label>
+                  <input id="gfm-accuracy-slider" type="range" min="0" max="300" step="10" value="0" />
+                </div>
               </div>
-              <div class="control-button" @click=${this._refreshAll} title="Refresh all devices">
-                <ha-icon icon="mdi:refresh"></ha-icon>
+
+              <div id="gfm-stats-panel" class="gfm-panel gfm-panel-topright gfm-hidden">
+                <div class="gfm-panel-title">📊 Estadísticas del recorrido</div>
+                <div id="gfm-stats-body" class="gfm-stats-body">Selecciona un dispositivo.</div>
+                ${
+                  this._config.enable_export
+                    ? `<div class="gfm-btn-row">
+                        <button id="gfm-export-gpx" class="gfm-chip">📁 GPX</button>
+                        <button id="gfm-export-kml" class="gfm-chip">📁 KML</button>
+                      </div>`
+                    : ""
+                }
+              </div>
+
+              <div id="gfm-playback-bar" class="gfm-panel gfm-panel-bottom gfm-hidden">
+                <div class="gfm-playback-controls">
+                  <button id="gfm-play-reset" class="gfm-icon-btn" title="Reiniciar">⏮️</button>
+                  <button id="gfm-play-toggle" class="gfm-icon-btn" title="Reproducir/Pausar">▶️</button>
+                  <input id="gfm-play-scrub" type="range" min="0" max="100" value="0" class="gfm-scrub" />
+                  <select id="gfm-play-speed" class="gfm-speed-select">
+                    <option value="1">1x</option>
+                    <option value="2">2x</option>
+                    <option value="5">5x</option>
+                    <option value="10">10x</option>
+                    <option value="25">25x</option>
+                  </select>
+                </div>
+                <div id="gfm-play-time" class="gfm-play-time">-</div>
               </div>
             </div>
           </div>
-
-          ${this._renderMap(devices)}
-
-          ${devices.length > 0 ? html`
-            <div class="device-sidebar ${this._showDeviceList ? 'open' : ''}">
-              <div class="device-list">
-                ${devices.map(device => this._renderDeviceCard(device))}
-              </div>
-            </div>
-          ` : html`
-            <div class="no-devices">
-              <ha-icon icon="mdi:devices" style="width: 48px; height: 48px;"></ha-icon>
-              <p>No Google Find My Device trackers found</p>
-            </div>
-          `}
         </ha-card>
       `;
-    } catch (error) {
-      console.error('[GoogleFindMy] Render error:', error);
-      return html`<ha-card><p style="padding: 16px; color: red;">Error rendering card. Check console.</p></ha-card>`;
+      this._wireEvents();
     }
-  }
 
-  _renderMap(devices) {
-    // Create a unified map view showing all devices
-    if (devices.length === 0) return html``;
-
-    const selectedDevice = this._selectedDevice ?
-      devices.find(d => d.entity_id === this._selectedDevice) :
-      devices[0];
-
-    if (!selectedDevice) return html``;
-
-    const entity = this.hass.states[selectedDevice.entity_id];
-    if (!entity || !entity.attributes.latitude) {
-      return html`
-        <div class="map-container">
-          <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: #5f6368;">
-            <div style="text-align: center;">
-              <ha-icon icon="mdi:map-marker-off" style="width: 48px; height: 48px; opacity: 0.5;"></ha-icon>
-              <p>Location not available</p>
-            </div>
-          </div>
-        </div>
+    _styles() {
+      return `
+        ha-card { overflow: hidden; }
+        .gfm-header {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 12px 16px; border-bottom: 1px solid var(--divider-color, #e0e0e0);
+        }
+        .gfm-title { font-size: 1.2em; font-weight: 500; color: var(--primary-text-color); }
+        .gfm-header-actions { display: flex; gap: 4px; }
+        .gfm-icon-btn {
+          background: none; border: none; cursor: pointer; font-size: 1.1em;
+          padding: 6px 8px; border-radius: 8px; color: var(--primary-text-color);
+        }
+        .gfm-icon-btn:hover { background: var(--secondary-background-color, #f0f0f0); }
+        .gfm-body { display: flex; position: relative; height: 480px; }
+        .gfm-devices {
+          width: 0; overflow: hidden; transition: width .2s ease; flex-shrink: 0;
+          background: var(--card-background-color); border-right: 1px solid var(--divider-color, #e0e0e0);
+        }
+        .gfm-devices.gfm-open, .gfm-devices.gfm-pinned { width: 220px; overflow-y: auto; }
+        .gfm-device-card {
+          padding: 10px 12px; border-bottom: 1px solid var(--divider-color, #eee);
+          cursor: pointer; display: flex; flex-direction: column; gap: 2px;
+        }
+        .gfm-device-card:hover { background: var(--secondary-background-color, #f5f5f5); }
+        .gfm-device-card.gfm-active { background: var(--primary-color); color: white; }
+        .gfm-device-name { font-weight: 500; font-size: 0.95em; display:flex; align-items:center; gap:6px; }
+        .gfm-status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .gfm-status-home { background: #4caf50; }
+        .gfm-status-away { background: #2196f3; }
+        .gfm-status-unknown { background: #9e9e9e; }
+        .gfm-device-sub { font-size: 0.78em; opacity: 0.8; }
+        .gfm-map-wrap { position: relative; flex: 1 1 auto; min-width: 0; height: 100%; }
+        .gfm-map { position: absolute; inset: 0; width: 100%; height: 100%; }
+        .gfm-error { padding: 24px; text-align: center; color: var(--error-color, #c00); }
+        .gfm-panel {
+          position: absolute; background: var(--card-background-color, white);
+          border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.25);
+          padding: 10px 12px; z-index: 500; font-size: 0.85em; max-width: 240px;
+        }
+        .gfm-panel-topright { top: 10px; right: 10px; }
+        .gfm-panel-bottom { left: 10px; right: 10px; bottom: 10px; max-width: none; }
+        .gfm-hidden { display: none; }
+        .gfm-panel-title { font-weight: 600; margin-bottom: 6px; }
+        .gfm-field { margin-top: 8px; }
+        .gfm-field label { display: block; font-size: 0.85em; margin-bottom: 4px; opacity: 0.85; }
+        .gfm-btn-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+        .gfm-chip {
+          border: 1px solid var(--divider-color, #ccc); background: transparent;
+          border-radius: 14px; padding: 4px 10px; font-size: 0.8em; cursor: pointer;
+          color: var(--primary-text-color);
+        }
+        .gfm-chip.gfm-active { background: var(--primary-color); color: white; border-color: var(--primary-color); }
+        .gfm-stats-body table { border-collapse: collapse; width: 100%; }
+        .gfm-stats-body td { padding: 2px 4px; font-size: 0.85em; }
+        .gfm-stats-body td:first-child { opacity: 0.75; }
+        .gfm-stats-body td:last-child { text-align: right; font-weight: 600; }
+        .gfm-playback-controls { display: flex; align-items: center; gap: 8px; }
+        .gfm-scrub { flex: 1; }
+        .gfm-speed-select { border-radius: 6px; }
+        .gfm-play-time { font-size: 0.78em; margin-top: 4px; text-align: center; opacity: 0.85; }
+        .gfm-marker-start, .gfm-marker-end {
+          font-size: 20px; line-height: 20px; text-align: center;
+          filter: drop-shadow(0 1px 2px rgba(0,0,0,.5));
+        }
+        .gfm-marker-numbered {
+          background: var(--primary-color, #2196f3); color: white; border-radius: 50%;
+          width: 22px; height: 22px; line-height: 22px; text-align: center;
+          font-size: 11px; font-weight: 700; box-shadow: 0 1px 3px rgba(0,0,0,.4);
+        }
+        .gfm-marker-playback {
+          font-size: 22px; line-height: 22px; text-align: center;
+          filter: drop-shadow(0 1px 3px rgba(0,0,0,.6));
+        }
+        @media (max-width: 768px) {
+          .gfm-devices.gfm-open, .gfm-devices.gfm-pinned { width: 170px; }
+          .gfm-panel { max-width: 190px; font-size: 0.8em; }
+        }
       `;
     }
 
-    // Use Leaflet map if loaded, otherwise fall back to iframe
-    if (this._leafletLoaded && this.config.use_leaflet_map !== false) {
-      return html`
-        <div class="map-container">
-          <div id="leaflet-map"></div>
-          ${this._renderFilterPanel()}
-        </div>
-      `;
-    }
+    _wireEvents() {
+      const $ = (id) => this.shadowRoot.getElementById(id);
 
-    // Fallback to iframe map
-    const mapUrl = this._getMapUrl(entity);
-    return html`
-      <div class="map-container">
-        ${mapUrl ? html`
-          <iframe
-            class="map-iframe"
-            src="${mapUrl}"
-            title="Device locations map"
-            @error=${() => this._handleMapError(entity.entity_id)}>
-          </iframe>
-        ` : html`
-          <div style="display: flex; align-items: center; justify-content: center; height: 100%; color: #5f6368;">
-            <div style="text-align: center;">
-              <ha-icon icon="mdi:map-marker-off" style="width: 48px; height: 48px; opacity: 0.5;"></ha-icon>
-              <p>Map unavailable</p>
-            </div>
-          </div>
-        `}
-
-      </div>
-    `;
-  }
-
-  _renderDeviceCard(device) {
-    const entity = this.hass.states[device.entity_id];
-    if (!entity) return html``;
-
-    const isHome = entity.state === 'home';
-    const isAway = entity.state === 'not_home';
-    const lastSeen = entity.attributes.last_seen;
-    const isSelected = this._selectedDevice === device.entity_id;
-
-    // Get location display text
-    const getLocationStatus = () => {
-      // Check for coordinates first - GoogleFindMy devices often have state="unknown" but valid coordinates
-      if (entity.attributes.latitude !== undefined && entity.attributes.longitude !== undefined) {
-        // If we're in a zone, show that
-        if (isHome) return 'At home';
-        if (entity.state && entity.state !== 'unknown' && entity.state !== 'unavailable' && entity.state !== 'not_home') {
-          // State is a zone name
-          return entity.state.charAt(0).toUpperCase() + entity.state.slice(1);
-        }
-        // If we have location_name, use it
-        if (entity.attributes.location_name) {
-          return entity.attributes.location_name;
-        }
-        // We have coordinates but not in a known zone
-        return 'Away';
-      }
-
-      // No coordinates - use state
-      if (isHome) return 'At home';
-      if (isAway) return 'Away';
-      if (entity.state && entity.state !== 'unknown' && entity.state !== 'unavailable') {
-        return entity.state.charAt(0).toUpperCase() + entity.state.slice(1);
-      }
-
-      return 'No location';
-    };
-
-    return html`
-      <div class="device-card ${isSelected ? 'selected' : ''}"
-           @click=${() => this._selectDevice(device.entity_id)}>
-        <div class="device-header">
-          <ha-icon class="device-icon" icon="${device.icon || 'mdi:map-marker-radius'}"></ha-icon>
-          <div class="device-info">
-            <div class="device-name">${device.name || entity.attributes.friendly_name}</div>
-            <div class="device-status">
-              <div class="status-dot ${isHome ? 'online' : isAway ? 'offline' : 'unknown'}"></div>
-              ${getLocationStatus()}
-            </div>
-            ${entity.attributes.location_name ? html`
-              <div class="device-location">${entity.attributes.location_name}</div>
-            ` : ''}
-            ${this.config.show_last_seen && lastSeen ? html`
-              <div class="last-seen">${this._formatTime(lastSeen)}</div>
-            ` : ''}
-          </div>
-        </div>
-
-        ${isSelected && this.config.enable_actions ? html`
-          <div class="device-actions">
-            <button class="action-button" @click=${(e) => this._playSound(e, device.entity_id)}>
-              <ha-icon icon="mdi:volume-high" style="width: 14px; height: 14px;"></ha-icon>
-              Play sound
-            </button>
-          </div>
-        ` : ''}
-      </div>
-    `;
-  }
-
-  _getDevices() {
-    if (!this.config.entities) return [];
-
-    return this.config.entities.map(entity => {
-      if (typeof entity === 'string') {
-        return { entity_id: entity };
-      }
-      return entity;
-    });
-  }
-
-  _toggleDeviceList() {
-    // If pinned and currently open, don't allow closing
-    if (this.config.keep_device_list_pinned && this._showDeviceList) {
-      return;
-    }
-    this._showDeviceList = !this._showDeviceList;
-    this.requestUpdate();
-  }
-
-  _selectDevice(entityId) {
-    this._selectedDevice = entityId;
-    this.requestUpdate();
-  }
-
-
-  _formatTime(timestamp) {
-    if (!timestamp) return 'Unknown';
-
-    let date;
-    // Handle different timestamp formats
-    if (typeof timestamp === 'string') {
-      date = new Date(timestamp);
-    } else if (typeof timestamp === 'number') {
-      // If timestamp is less than a recent date in milliseconds, assume it's in seconds
-      date = timestamp < 1000000000000 ? new Date(timestamp * 1000) : new Date(timestamp);
-    } else {
-      return 'Unknown';
-    }
-
-    // Check if date is valid
-    if (isNaN(date.getTime())) return 'Unknown';
-
-    const now = new Date();
-    const diff = now - date;
-
-    if (diff < 60000) return 'Just now';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-    return date.toLocaleDateString();
-  }
-
-  _renderFilterPanel() {
-    return html`
-      <div class="filter-panel ${this._showFilters ? '' : 'collapsed'}">
-        <button class="filter-toggle" @click=${() => { this._showFilters = !this._showFilters; }}>
-          ${this._showFilters ? '✕ Close' : '📅 Filters'}
-        </button>
-
-        ${this._showFilters ? html`
-          <div class="filter-content">
-            <!-- Time Range Section -->
-            <div class="filter-section">
-              <span class="filter-label">Time Range</span>
-              <div class="time-range-buttons">
-                <button class="time-range-btn ${this._historyDays === 1 ? 'active' : ''}"
-                        @click=${() => this._setHistoryDays(1)}>1d</button>
-                <button class="time-range-btn ${this._historyDays === 3 ? 'active' : ''}"
-                        @click=${() => this._setHistoryDays(3)}>3d</button>
-                <button class="time-range-btn ${this._historyDays === 7 ? 'active' : ''}"
-                        @click=${() => this._setHistoryDays(7)}>7d</button>
-              </div>
-            </div>
-
-            <!-- Accuracy Filter Section -->
-            <div class="filter-section">
-              <span class="filter-label">Accuracy Filter</span>
-              <div class="accuracy-slider-container">
-                <input type="range" class="accuracy-slider"
-                       min="0" max="300" step="10"
-                       .value=${this._accuracyFilter}
-                       @input=${(e) => this._setAccuracyFilter(e.target.value)}>
-                <span class="accuracy-value">
-                  ${this._accuracyFilter === 0 ? 'Off' : `${this._accuracyFilter}m`}
-                </span>
-              </div>
-            </div>
-
-            <!-- Marker Opacity Section -->
-            <div class="filter-section">
-              <span class="filter-label">Marker Transparency</span>
-              <div class="accuracy-slider-container">
-                <input type="range" class="accuracy-slider"
-                       min="0" max="100" step="5"
-                       .value=${this._markerOpacity}
-                       @input=${(e) => this._setMarkerOpacity(e.target.value)}>
-                <span class="accuracy-value">${this._markerOpacity}%</span>
-              </div>
-            </div>
-
-            <div style="font-size: 11px; color: #666; margin-top: 8px;">
-              ${this._locationHistory.length} location${this._locationHistory.length !== 1 ? 's' : ''} shown
-            </div>
-          </div>
-        ` : ''}
-      </div>
-    `;
-  }
-
-  _setHistoryDays(days) {
-    this._historyDays = days;
-    this._saveFilterSettings();
-    this._fetchLocationHistory();
-  }
-
-  _setAccuracyFilter(value) {
-    this._accuracyFilter = parseInt(value);
-    this._saveFilterSettings();
-    this._updateMap();
-  }
-
-  _setMarkerOpacity(value) {
-    this._markerOpacity = parseInt(value);
-    this._saveFilterSettings();
-    this._updateMap();
-  }
-
-  async _fetchLocationHistory() {
-    const devices = this._getDevices();
-    const selectedDevice = this._selectedDevice ?
-      devices.find(d => d.entity_id === this._selectedDevice) :
-      devices[0];
-
-    if (!selectedDevice) {
-      console.warn('[GoogleFindMy] No device selected for history fetch');
-      return;
-    }
-
-    const entity = this.hass.states[selectedDevice.entity_id];
-    if (!entity) {
-      console.warn('[GoogleFindMy] Entity not found:', selectedDevice.entity_id);
-      return;
-    }
-
-    const entityId = entity.entity_id;
-    const endTime = new Date();
-    const startTime = new Date(endTime - this._historyDays * 24 * 60 * 60 * 1000);
-
-
-    try {
-      // Fetch history from Home Assistant
-      const history = await this.hass.callWS({
-        type: 'history/history_during_period',
-        start_time: startTime.toISOString(),
-        end_time: endTime.toISOString(),
-        entity_ids: [entityId],
-        minimal_response: false,
-        significant_changes_only: false
+      $("gfm-btn-devices").addEventListener("click", () => this._togglePanel("devices"));
+      $("gfm-btn-filters").addEventListener("click", () => this._togglePanel("filters"));
+      $("gfm-btn-refresh").addEventListener("click", () => {
+        if (this._selectedEntityId) this._selectDevice(this._selectedEntityId, false);
       });
+      const statsBtn = $("gfm-btn-stats");
+      if (statsBtn) statsBtn.addEventListener("click", () => this._togglePanel("stats"));
+      const playBtn = $("gfm-btn-playback");
+      if (playBtn) playBtn.addEventListener("click", () => this._togglePanel("playback"));
 
+      this.shadowRoot.querySelectorAll("[data-days]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          this._runtimeFilters.days = parseInt(btn.dataset.days, 10);
+          this._refreshDaysChips();
+          if (this._selectedEntityId) this._selectDevice(this._selectedEntityId, false);
+        });
+      });
+      this._refreshDaysChips();
 
-      // Process history data - response format is {entity_id: [...states]}
-      const locations = [];
-      let lastSeen = null;
+      const accSlider = $("gfm-accuracy-slider");
+      if (accSlider) {
+        accSlider.value = this._runtimeFilters.accuracy;
+        this._refreshAccuracyLabel();
+        accSlider.addEventListener("input", () => {
+          this._runtimeFilters.accuracy = parseInt(accSlider.value, 10);
+          this._refreshAccuracyLabel();
+          this._redraw();
+        });
+      }
 
-      // Get the array of states from the response object
-      const stateArray = history && history[entityId] ? history[entityId] : null;
+      const exportGpx = $("gfm-export-gpx");
+      if (exportGpx) exportGpx.addEventListener("click", () => this._doExport("gpx"));
+      const exportKml = $("gfm-export-kml");
+      if (exportKml) exportKml.addEventListener("click", () => this._doExport("kml"));
 
-      if (stateArray && stateArray.length > 0) {
+      const playToggle = $("gfm-play-toggle");
+      if (playToggle) playToggle.addEventListener("click", () => this._togglePlayback());
+      const playReset = $("gfm-play-reset");
+      if (playReset) playReset.addEventListener("click", () => this._resetPlayback());
+      const scrub = $("gfm-play-scrub");
+      if (scrub) {
+        scrub.addEventListener("input", () => {
+          this._stopPlayback(false);
+          const idx = Math.round((scrub.value / 100) * (this._points.length - 1));
+          this._playback.index = Math.max(0, idx);
+          this._updatePlaybackMarker();
+        });
+      }
+      const speedSel = $("gfm-play-speed");
+      if (speedSel) {
+        speedSel.addEventListener("change", () => {
+          this._playback.speed = parseFloat(speedSel.value);
+          if (this._playback.playing) {
+            this._stopPlayback(false);
+            this._startPlayback();
+          }
+        });
+      }
+    }
 
-        for (const state of stateArray) {
-          // Handle both full object format and compact format
-          const attrs = state.a || state.attributes;
-          const lat = attrs?.latitude;
-          const lon = attrs?.longitude;
-          const currentLastSeen = attrs?.last_seen;
+    _refreshDaysChips() {
+      this.shadowRoot.querySelectorAll("[data-days]").forEach((btn) => {
+        btn.classList.toggle("gfm-active", parseInt(btn.dataset.days, 10) === this._runtimeFilters.days);
+      });
+    }
 
-          if (lat !== undefined && lon !== undefined) {
-            // Skip duplicates based on last_seen
-            if (currentLastSeen && currentLastSeen === lastSeen) {
-              continue;
-            }
-            lastSeen = currentLastSeen;
+    _refreshAccuracyLabel() {
+      const label = this.shadowRoot.getElementById("gfm-accuracy-val");
+      if (!label) return;
+      label.textContent =
+        this._runtimeFilters.accuracy === 0 ? "0 m (desactivado)" : `${this._runtimeFilters.accuracy} m`;
+    }
 
-            locations.push({
-              lat,
-              lon,
-              accuracy: attrs?.gps_accuracy || 0,
-              timestamp: state.last_changed || state.lu,
-              lastSeen: currentLastSeen,
-              isOwnReport: attrs?.is_own_report,
-              semanticLocation: attrs?.semantic_location,
-              state: state.s || state.state
+    _togglePanel(name) {
+      const map = {
+        devices: "gfm-devices",
+        filters: "gfm-filters-panel",
+        stats: "gfm-stats-panel",
+        playback: "gfm-playback-bar",
+      };
+      this._panelState[name] = !this._panelState[name];
+      const el = this.shadowRoot.getElementById(map[name]);
+      if (!el) return;
+      if (name === "devices") {
+        el.classList.toggle("gfm-open", this._panelState.devices || this._config.keep_device_list_pinned);
+      } else {
+        el.classList.toggle("gfm-hidden", !this._panelState[name]);
+      }
+    }
+
+    _initMap() {
+      const L = window.L;
+      const mapEl = this.shadowRoot.getElementById("gfm-map");
+      this._map = L.map(mapEl, { zoomControl: true }).setView([0, 0], 2);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap contributors",
+      }).addTo(this._map);
+      this._layerGroup = L.layerGroup().addTo(this._map);
+
+      const kickResize = () => {
+        if (!this._map) return;
+        this._map.invalidateSize({ animate: false, pan: false });
+        if (this._points && this._points.length > 0) {
+          try {
+            const bounds = L.latLngBounds(this._points.map((p) => [p.lat, p.lon]));
+            this._map.fitBounds(bounds.pad(0.2), { animate: false });
+          } catch (e) {
+            /* ignore */
+          }
+        }
+      };
+      if (window.ResizeObserver) {
+        this._resizeObserver = new ResizeObserver(() => kickResize());
+        this._resizeObserver.observe(mapEl);
+      }
+      [0, 200, 500, 1200].forEach((ms) => setTimeout(() => this._map && this._map.invalidateSize(), ms));
+    }
+
+    _updateDeviceList() {
+      const container = this.shadowRoot.getElementById("gfm-devices");
+      if (!container) return;
+      const entities = this._resolveEntities();
+      container.innerHTML = "";
+      if (this._config.keep_device_list_pinned) container.classList.add("gfm-pinned");
+
+      entities.forEach((cfgEntity) => {
+        const state = this._hass.states[cfgEntity.entity];
+        const card = document.createElement("div");
+        card.className = "gfm-device-card" + (cfgEntity.entity === this._selectedEntityId ? " gfm-active" : "");
+        const name = cfgEntity.name || (state ? state.attributes.friendly_name : cfgEntity.entity);
+        const statusClass = !state
+          ? "gfm-status-unknown"
+          : state.state === "home"
+          ? "gfm-status-home"
+          : state.state === "not_home"
+          ? "gfm-status-away"
+          : "gfm-status-unknown";
+        const lastSeen =
+          this._config.show_last_seen && state ? formatTime(new Date(state.last_updated)) : "";
+        const locName =
+          this._config.show_location_name && state && state.attributes.address
+            ? state.attributes.address
+            : "";
+        card.innerHTML = `
+          <div class="gfm-device-name"><span class="gfm-status-dot ${statusClass}"></span>${escapeHTML(name)}</div>
+          ${lastSeen ? `<div class="gfm-device-sub">🕒 ${escapeHTML(lastSeen)}</div>` : ""}
+          ${locName ? `<div class="gfm-device-sub">📍 ${escapeHTML(locName)}</div>` : ""}
+        `;
+        card.addEventListener("click", () => this._selectDevice(cfgEntity.entity, false));
+        container.appendChild(card);
+      });
+    }
+
+    async _selectDevice(entityId, keepView) {
+      this._selectedEntityId = entityId;
+      this._stopPlayback();
+      this._updateDeviceList();
+      await this._loadHistoryAndDraw(entityId, keepView);
+    }
+
+    async _fetchHistory(entityId, days) {
+      const end = new Date();
+      const start = new Date(end.getTime() - days * 86400000);
+      const path = `history/period/${start.toISOString()}?filter_entity_id=${encodeURIComponent(
+        entityId
+      )}&end_time=${encodeURIComponent(end.toISOString())}&minimal_response&no_attributes=false`;
+      let result;
+      try {
+        result = await this._hass.callApi("GET", path);
+      } catch (e) {
+        console.error("[googlefindmy-card-tracker] Error obteniendo historial:", e);
+        return [];
+      }
+      const raw = (result && result[0]) || [];
+      const points = raw
+        .filter((s) => s.attributes && s.attributes.latitude != null && s.attributes.longitude != null)
+        .map((s) => ({
+          lat: s.attributes.latitude,
+          lon: s.attributes.longitude,
+          accuracy: s.attributes.gps_accuracy ?? s.attributes.accuracy ?? null,
+          timestamp: new Date(s.last_updated || s.last_changed),
+          source: s.attributes.address || s.attributes.location_name || "",
+          state: s.state,
+        }))
+        .sort((a, b) => a.timestamp - b.timestamp);
+
+      const deduped = [];
+      for (const p of points) {
+        const prev = deduped[deduped.length - 1];
+        if (!prev || prev.lat !== p.lat || prev.lon !== p.lon) deduped.push(p);
+      }
+      return deduped;
+    }
+
+    async _loadHistoryAndDraw(entityId, keepView) {
+      const days = this._runtimeFilters.days;
+      const raw = await this._fetchHistory(entityId, days);
+      this._allPoints = raw;
+      this._redraw(keepView);
+    }
+
+    _filteredPoints() {
+      const acc = this._runtimeFilters.accuracy;
+      let pts = this._allPoints || [];
+      if (acc > 0) {
+        pts = pts.filter((p) => p.accuracy == null || p.accuracy <= acc);
+      }
+      return pts;
+    }
+
+    _redraw(keepView) {
+      this._points = this._filteredPoints();
+      if (this._map) this._map.invalidateSize({ animate: false });
+      this._drawMap(keepView);
+      this._updateStats();
+      this._resetPlayback();
+    }
+
+    _drawMap(keepView) {
+      if (!this._map || !window.L) return;
+      const L = window.L;
+      this._layerGroup.clearLayers();
+      this._decorator = null;
+
+      const points = this._points;
+      if (points.length === 0) return;
+
+      const latlngs = points.map((p) => [p.lat, p.lon]);
+
+      if (this._config.show_path_lines && points.length > 1) {
+        const line = L.polyline(latlngs, { color: "#2196f3", weight: 4, opacity: 0.8 });
+        line.addTo(this._layerGroup);
+
+        if (this._config.show_direction_arrows && L.polylineDecorator) {
+          try {
+            this._decorator = L.polylineDecorator(line, {
+              patterns: [
+                {
+                  offset: "8%",
+                  repeat: "12%",
+                  symbol: L.Symbol.arrowHead({
+                    pixelSize: 10,
+                    polygon: false,
+                    pathOptions: { stroke: true, color: "#0d47a1", weight: 2 },
+                  }),
+                },
+              ],
             });
+            this._decorator.addTo(this._layerGroup);
+          } catch (e) {
+            console.warn("[googlefindmy-card-tracker] No se pudieron dibujar las flechas:", e);
           }
         }
-      } else {
-        console.warn('[GoogleFindMy] No state data found in history response');
       }
 
-      this._locationHistory = locations;
-      this._updateMap();
-    } catch (err) {
-      console.error('[GoogleFindMy] Failed to fetch location history:', err);
-      this._locationHistory = [];
-    }
-  }
+      points.forEach((p, idx) => {
+        if (p.accuracy) {
+          L.circle([p.lat, p.lon], {
+            radius: p.accuracy,
+            color: "#2196f3",
+            weight: 1,
+            fillOpacity: 0.06,
+            opacity: 0.25,
+          }).addTo(this._layerGroup);
+        }
 
-  _getMapUrl(entity) {
-    // Get the device configuration URL if available
-    if (entity.attributes.configuration_url) {
-      // Add a unique parameter to prevent caching issues
-      const separator = entity.attributes.configuration_url.includes('?') ? '&' : '?';
-      return `${entity.attributes.configuration_url}${separator}_t=${Date.now()}`;
-    }
+        const isStart = idx === 0;
+        const isEnd = idx === points.length - 1;
+        let icon = null;
 
-    // Fallback to OpenStreetMap if coordinates are available
-    const lat = entity.attributes.latitude;
-    const lon = entity.attributes.longitude;
-    if (lat && lon) {
-      return `https://www.openstreetmap.org/export/embed.html?bbox=${lon-0.01},${lat-0.01},${lon+0.01},${lat+0.01}&layer=mapnik&marker=${lat},${lon}`;
-    }
-
-    // No coordinates available
-    return null;
-  }
-
-  _updateMap() {
-    if (!this._leafletLoaded || !window.L) return;
-
-    // Initialize retry counter if not exists
-    if (!this._mapRetryCount) this._mapRetryCount = 0;
-
-    // Wait for the map container to be in the DOM and have dimensions
-    setTimeout(() => {
-      const mapContainer = this.shadowRoot.querySelector('#leaflet-map');
-      if (!mapContainer) {
-        this._mapRetryCount = 0;
-        return;
-      }
-
-      // Check if container has dimensions
-      const rect = mapContainer.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) {
-        // Limit retries to prevent infinite loop (max 5 attempts = 1 second)
-        if (this._mapRetryCount < 5) {
-          this._mapRetryCount++;
-          console.warn(`[GoogleFindMy] Map container has no dimensions, retry ${this._mapRetryCount}/5...`);
-          setTimeout(() => this._updateMap(), 200);
+        if (isStart && isEnd) {
+          icon = L.divIcon({
+            className: "",
+            html: `<div class="gfm-marker-end">🔴</div>`,
+            iconSize: [26, 26],
+            iconAnchor: [13, 22],
+          });
+        } else if (isStart && this._config.show_start_end_markers) {
+          icon = L.divIcon({
+            className: "",
+            html: `<div class="gfm-marker-start">🏁</div>`,
+            iconSize: [26, 26],
+            iconAnchor: [13, 22],
+          });
+        } else if (isEnd && this._config.show_start_end_markers) {
+          icon = L.divIcon({
+            className: "",
+            html: `<div class="gfm-marker-end">🔴</div>`,
+            iconSize: [26, 26],
+            iconAnchor: [13, 22],
+          });
+        } else if (this._config.show_numbered_markers) {
+          icon = L.divIcon({
+            className: "",
+            html: `<div class="gfm-marker-numbered">${idx}</div>`,
+            iconSize: [22, 22],
+            iconAnchor: [11, 11],
+          });
         } else {
-          console.warn('[GoogleFindMy] Map container never got dimensions, giving up (likely in preview/hidden state)');
-          this._mapRetryCount = 0;
+          icon = L.divIcon({
+            className: "",
+            html: `<div style="background:#64b5f6;width:10px;height:10px;border-radius:50%;border:2px solid white;box-shadow:0 1px 2px rgba(0,0,0,.4);"></div>`,
+            iconSize: [10, 10],
+            iconAnchor: [5, 5],
+          });
         }
-        return;
-      }
 
-      // Reset retry counter on success
-      this._mapRetryCount = 0;
-
-      // Get current device
-      const devices = this._getDevices();
-      const selectedDevice = this._selectedDevice ?
-        devices.find(d => d.entity_id === this._selectedDevice) :
-        devices[0];
-
-      if (!selectedDevice) return;
-
-      const entity = this.hass.states[selectedDevice.entity_id];
-      if (!entity || !entity.attributes.latitude) return;
-
-      const lat = entity.attributes.latitude;
-      const lon = entity.attributes.longitude;
-      const accuracy = entity.attributes.gps_accuracy || 0;
-
-      // Only create map once - never recreate
-      if (!this._mapInstance) {
-        console.log('[GoogleFindMy] Creating new map instance');
-
-        // Fix Leaflet marker icon paths (point to CDN)
-        delete L.Icon.Default.prototype._getIconUrl;
-        L.Icon.Default.mergeOptions({
-          iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-          iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-          shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png'
-        });
-
-        // Create new map instance
-        this._mapInstance = L.map(mapContainer, {
-          preferCanvas: true,
-          zoomControl: true
-        }).setView([lat, lon], 13);
-
-        // Add OpenStreetMap tiles with error handling
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '© OpenStreetMap contributors',
-          maxZoom: 19,
-          errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
-        }).addTo(this._mapInstance);
-
-        // Wait for tiles to render before invalidating size
-        this._mapInstance.whenReady(() => {
-          console.log('[GoogleFindMy] Map ready, invalidating size');
-          setTimeout(() => {
-            if (this._mapInstance) {
-              this._mapInstance.invalidateSize(true);
-            }
-          }, 50);
-        });
-
-        // Fetch history when map is first created
-        this._fetchLocationHistory();
-      } else {
-        // Map already exists, zoom to current device location
-        this._mapInstance.setView([lat, lon], 15);
-      }
-
-      // Clear existing markers and lines
-      this._mapInstance.eachLayer((layer) => {
-        if (layer instanceof L.Marker || layer instanceof L.Circle || layer instanceof L.Polyline) {
-          this._mapInstance.removeLayer(layer);
-        }
+        const marker = L.marker([p.lat, p.lon], { icon }).addTo(this._layerGroup);
+        const label = isStart ? "🏁 Inicio" : isEnd ? "🔴 Fin / Actual" : `Punto ${idx}`;
+        marker.bindPopup(`
+          <b>${escapeHTML(label)}</b><br/>
+          Lat/Lon: ${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}<br/>
+          Precisión: ${p.accuracy != null ? Math.round(p.accuracy) + " m" : "N/D"}<br/>
+          Hora: ${escapeHTML(formatTime(p.timestamp))}
+          ${p.source ? `<br/>Ubicación: ${escapeHTML(p.source)}` : ""}
+        `);
       });
 
-      const deviceName = selectedDevice.name || entity.attributes.friendly_name || 'Device';
-      const allMarkers = [];
+      if (this._map) this._map.invalidateSize({ animate: false });
 
-      // Filter and plot historical locations
-      const filteredHistory = this._locationHistory.filter(loc =>
-        this._accuracyFilter === 0 || loc.accuracy <= this._accuracyFilter
+      if (!keepView) {
+        try {
+          const bounds = L.latLngBounds(latlngs);
+          this._map.fitBounds(bounds.pad(0.2), { animate: false });
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      setTimeout(() => {
+        if (!this._map) return;
+        this._map.invalidateSize({ animate: false });
+        if (!keepView) {
+          try {
+            const bounds = L.latLngBounds(latlngs);
+            this._map.fitBounds(bounds.pad(0.2), { animate: false });
+          } catch (e) {
+            /* ignore */
+          }
+        }
+      }, 150);
+    }
+
+    _updateStats() {
+      const body = this.shadowRoot.getElementById("gfm-stats-body");
+      if (!body) return;
+      const stats = computeStats(this._points);
+      this._lastStats = stats;
+      if (stats.count === 0) {
+        body.innerHTML = "Sin datos de ubicación en el rango seleccionado.";
+        return;
+      }
+      body.innerHTML = `
+        <table>
+          <tr><td>Puntos</td><td>${stats.count}</td></tr>
+          <tr><td>Distancia</td><td>${formatDistance(stats.distanceKm)}</td></tr>
+          <tr><td>Duración</td><td>${formatDuration(stats.durationMs)}</td></tr>
+          <tr><td>Vel. media</td><td>${stats.avgSpeed.toFixed(1)} km/h</td></tr>
+          <tr><td>Vel. máxima</td><td>${stats.maxSpeed.toFixed(1)} km/h</td></tr>
+          <tr><td>Desde</td><td>${formatTime(stats.start)}</td></tr>
+          <tr><td>Hasta</td><td>${formatTime(stats.end)}</td></tr>
+        </table>
+      `;
+    }
+
+    _doExport(type) {
+      if (!this._points || this._points.length === 0) return;
+      const entityState = this._hass.states[this._selectedEntityId];
+      const name = entityState ? entityState.attributes.friendly_name : this._selectedEntityId;
+      const safeName = name.replace(/[^a-z0-9_-]+/gi, "_");
+      const stamp = new Date().toISOString().slice(0, 10);
+      if (type === "gpx") {
+        downloadFile(`${safeName}_${stamp}.gpx`, buildGPX(this._points, name), "application/gpx+xml");
+      } else {
+        downloadFile(`${safeName}_${stamp}.kml`, buildKML(this._points, name), "application/vnd.google-earth.kml+xml");
+      }
+    }
+
+    _togglePlayback() {
+      if (this._playback.playing) {
+        this._stopPlayback();
+      } else {
+        this._startPlayback();
+      }
+    }
+
+    _startPlayback() {
+      if (!this._points || this._points.length < 2 || !window.L) return;
+      this._playback.playing = true;
+      const btn = this.shadowRoot.getElementById("gfm-play-toggle");
+      if (btn) btn.textContent = "⏸️";
+      const baseInterval = 900;
+      const tick = () => {
+        if (this._playback.index >= this._points.length - 1) {
+          this._stopPlayback();
+          return;
+        }
+        this._playback.index += 1;
+        this._updatePlaybackMarker();
+      };
+      const interval = Math.max(60, baseInterval / this._playback.speed);
+      this._playback.timer = setInterval(tick, interval);
+    }
+
+    _stopPlayback(resetIcon = true) {
+      if (this._playback.timer) {
+        clearInterval(this._playback.timer);
+        this._playback.timer = null;
+      }
+      this._playback.playing = false;
+      if (resetIcon) {
+        const btn = this.shadowRoot.getElementById("gfm-play-toggle");
+        if (btn) btn.textContent = "▶️";
+      }
+    }
+
+    _resetPlayback() {
+      this._stopPlayback();
+      this._playback.index = 0;
+      if (this._playback.marker && this._layerGroup) {
+        this._layerGroup.removeLayer(this._playback.marker);
+        this._playback.marker = null;
+      }
+      const scrub = this.shadowRoot.getElementById("gfm-play-scrub");
+      if (scrub) scrub.value = 0;
+      const timeLabel = this.shadowRoot.getElementById("gfm-play-time");
+      if (timeLabel) timeLabel.textContent = this._points.length ? formatTime(this._points[0].timestamp) : "-";
+    }
+
+    _updatePlaybackMarker() {
+      const L = window.L;
+      if (!L || !this._layerGroup || this._points.length === 0) return;
+      const idx = this._playback.index;
+      const p = this._points[idx];
+      if (!p) return;
+
+      let angle = 0;
+      if (idx > 0) {
+        const prev = this._points[idx - 1];
+        angle = bearingDegrees(prev.lat, prev.lon, p.lat, p.lon);
+      }
+
+      if (!this._playback.marker) {
+        const icon = L.divIcon({
+          className: "",
+          html: `<div class="gfm-marker-playback" style="transform: rotate(${angle}deg);">➤</div>`,
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+        });
+        this._playback.marker = L.marker([p.lat, p.lon], { icon, zIndexOffset: 1000 }).addTo(this._layerGroup);
+      } else {
+        this._playback.marker.setLatLng([p.lat, p.lon]);
+        const el = this._playback.marker.getElement();
+        if (el) {
+          const inner = el.querySelector(".gfm-marker-playback");
+          if (inner) inner.style.transform = `rotate(${angle}deg)`;
+        }
+      }
+
+      const scrub = this.shadowRoot.getElementById("gfm-play-scrub");
+      if (scrub) scrub.value = Math.round((idx / (this._points.length - 1)) * 100);
+      const timeLabel = this.shadowRoot.getElementById("gfm-play-time");
+      if (timeLabel) timeLabel.textContent = formatTime(p.timestamp);
+
+      if (this._map) this._map.panTo([p.lat, p.lon], { animate: true, duration: 0.3 });
+    }
+  }
+
+  class GoogleFindMyCardTrackerEditor extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: "open" });
+      this._config = {};
+    }
+
+    setConfig(config) {
+      this._config = { ...DEFAULT_CONFIG, ...config };
+      this._render();
+    }
+
+    set hass(hass) {
+      this._hass = hass;
+    }
+
+    _entitiesToText(entities) {
+      return (entities || [])
+        .map((e) => {
+          if (typeof e === "string") return e;
+          return [e.entity, e.name || "", e.icon || ""].filter((v, i) => i === 0 || v).join("|");
+        })
+        .join("\n");
+    }
+
+    _textToEntities(text) {
+      return text
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [entity, name, icon] = line.split("|").map((v) => (v || "").trim());
+          if (!name && !icon) return entity;
+          const obj = { entity };
+          if (name) obj.name = name;
+          if (icon) obj.icon = icon;
+          return obj;
+        });
+    }
+
+    _emitChange() {
+      this.dispatchEvent(
+        new CustomEvent("config-changed", {
+          detail: { config: this._config },
+          bubbles: true,
+          composed: true,
+        })
       );
+    }
 
-      if (filteredHistory.length > 0) {
-        // Draw path line connecting historical points (if enabled in config)
-        if (this.config.show_path_lines !== false) {
-          const pathCoords = filteredHistory.map(loc => [loc.lat, loc.lon]);
-          L.polyline(pathCoords, {
-            color: '#1a73e8',
-            weight: 2,
-            opacity: 0.6,
-            smoothFactor: 1
-          }).addTo(this._mapInstance);
-        }
+    _render() {
+      const c = this._config;
+      const checkbox = (key, label) => `
+        <label class="gfm-ed-row">
+          <input type="checkbox" data-key="${key}" ${c[key] ? "checked" : ""}/>
+          <span>${label}</span>
+        </label>`;
 
-        // Add markers for historical locations with standard Leaflet pins
-        filteredHistory.forEach((loc, index) => {
-          const isLast = index === filteredHistory.length - 1;
-
-          // Calculate opacity as decimal (0-1) from percentage (0-100)
-          const markerOpacity = this._markerOpacity / 100;
-
-          // Use standard Leaflet marker (default blue pin icon) at 75% size
-          const smallBlueIcon = L.icon({
-            iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-            shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-            iconSize: [18.75, 30.75],  // 75% of default 25x41
-            iconAnchor: [9.375, 30.75],
-            popupAnchor: [0.75, -25.5],
-            shadowSize: [30.75, 30.75]
-          });
-
-          const marker = L.marker([loc.lat, loc.lon], {
-            icon: smallBlueIcon,
-            opacity: markerOpacity,
-            zIndexOffset: -1000  // Place historical markers below current marker
-          }).addTo(this._mapInstance);
-
-          allMarkers.push(marker);
-
-          // Add accuracy circle matching Map View style
-          if (loc.accuracy > 0) {
-            const circle = L.circle([loc.lat, loc.lon], {
-              radius: loc.accuracy,
-              color: '#1a73e8',
-              fillColor: '#1a73e8',
-              fillOpacity: 0.1 * markerOpacity,
-              weight: 2,
-              opacity: 0.5 * markerOpacity
-            }).addTo(this._mapInstance);
+      this.shadowRoot.innerHTML = `
+        <style>
+          .gfm-ed-wrap { display: flex; flex-direction: column; gap: 10px; padding: 8px 0; }
+          .gfm-ed-row { display: flex; align-items: center; gap: 8px; font-size: 0.95em; }
+          .gfm-ed-field label { display:block; font-size: 0.85em; margin-bottom: 4px; opacity: .8; }
+          .gfm-ed-field input[type=text], .gfm-ed-field textarea, .gfm-ed-field select {
+            width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
+            border: 1px solid var(--divider-color, #ccc); font-family: inherit;
           }
+          .gfm-ed-field textarea { min-height: 70px; font-family: monospace; font-size: 0.85em; }
+          .gfm-ed-section { font-weight: 600; margin-top: 6px; border-top: 1px solid var(--divider-color,#eee); padding-top:8px; }
+          .gfm-ed-hint { font-size: 0.75em; opacity: 0.7; margin-top: -4px; }
+        </style>
+        <div class="gfm-ed-wrap">
+          <div class="gfm-ed-field">
+            <label>Título</label>
+            <input type="text" id="ed-title" value="${escapeHTML(c.title)}" />
+          </div>
 
-          // Determine report source like Map View
-          let reportSource = '❓ Unknown';
-          let reportColor = '#6c757d';
-          if (loc.isOwnReport === true) {
-            reportSource = '📱 Own Device';
-            reportColor = '#28a745';
-          } else if (loc.isOwnReport === false) {
-            reportSource = '🌐 Network/Crowd-sourced';
-            reportColor = '#007cba';
-          }
+          <div class="gfm-ed-field">
+            <label>Entidades (una por línea: entity_id|Nombre opcional|icono opcional)</label>
+            <textarea id="ed-entities">${escapeHTML(this._entitiesToText(c.entities))}</textarea>
+            <div class="gfm-ed-hint">Ej: device_tracker.iphone|iPhone de Juan|mdi:cellphone-iphone</div>
+          </div>
 
-          // Create popup matching Map View
-          const timestamp = new Date(loc.timestamp * 1000).toLocaleString();
-          const popupContent = `
-            <div style="min-width: 200px;">
-              <b>Location ${index + 1}</b><br>
-              <b>Coordinates:</b> ${loc.lat.toFixed(6)}, ${loc.lon.toFixed(6)}<br>
-              <b>GPS Accuracy:</b> ${loc.accuracy.toFixed(1)} meters<br>
-              <b>Timestamp:</b> ${timestamp}<br>
-              <b style="color: ${reportColor}">Report Source:</b> <span style="color: ${reportColor}">${reportSource}</span><br>
-              ${loc.semanticLocation ? `<b>Location Name:</b> ${loc.semanticLocation}<br>` : ''}
-              <b>Entity State:</b> ${loc.state || 'Unknown'}<br>
-            </div>
-          `;
-          marker.bindPopup(popupContent);
+          <div class="gfm-ed-field">
+            <label>Filtrar por palabra clave (opcional)</label>
+            <input type="text" id="ed-keywords" value="${escapeHTML(c.filter_keywords)}" />
+          </div>
+
+          <div class="gfm-ed-field">
+            <label>Rango de historial por defecto</label>
+            <select id="ed-days">
+              ${[1, 3, 7, 14]
+                .map((d) => `<option value="${d}" ${c.history_days === d ? "selected" : ""}>${d} día(s)</option>`)
+                .join("")}
+            </select>
+          </div>
+
+          <div class="gfm-ed-section">Visualización</div>
+          ${checkbox("show_last_seen", "Mostrar última vez visto")}
+          ${checkbox("show_location_name", "Mostrar nombre de ubicación")}
+          ${checkbox("enable_actions", "Habilitar acciones (reproducir sonido)")}
+          ${checkbox("keep_device_list_pinned", "Mantener lista de dispositivos fija")}
+          ${checkbox("show_path_lines", "Mostrar línea de recorrido")}
+
+          <div class="gfm-ed-section">🗺️ Recorrido</div>
+          ${checkbox("show_start_end_markers", "🏁 Marcador de inicio / 🔴 fin")}
+          ${checkbox("show_numbered_markers", "🔢 Marcadores numerados")}
+          ${checkbox("show_direction_arrows", "➜ Flechas de dirección")}
+          ${checkbox("enable_playback", "🎞️ Reproducción del recorrido")}
+          ${checkbox("show_statistics", "📊 Estadísticas")}
+          ${checkbox("enable_export", "📁 Exportación GPX/KML")}
+        </div>
+      `;
+
+      this.shadowRoot.getElementById("ed-title").addEventListener("input", (e) => {
+        this._config = { ...this._config, title: e.target.value };
+        this._emitChange();
+      });
+      this.shadowRoot.getElementById("ed-entities").addEventListener("change", (e) => {
+        this._config = { ...this._config, entities: this._textToEntities(e.target.value) };
+        this._emitChange();
+      });
+      this.shadowRoot.getElementById("ed-keywords").addEventListener("input", (e) => {
+        this._config = { ...this._config, filter_keywords: e.target.value };
+        this._emitChange();
+      });
+      this.shadowRoot.getElementById("ed-days").addEventListener("change", (e) => {
+        this._config = { ...this._config, history_days: parseInt(e.target.value, 10) };
+        this._emitChange();
+      });
+      this.shadowRoot.querySelectorAll('input[type="checkbox"][data-key]').forEach((input) => {
+        input.addEventListener("change", (e) => {
+          this._config = { ...this._config, [e.target.dataset.key]: e.target.checked };
+          this._emitChange();
         });
-
-        // Add current device location marker in RED with full opacity
-        const redIcon = L.icon({
-          iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
-          shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-          iconSize: [25, 41],
-          iconAnchor: [12, 41],
-          popupAnchor: [1, -34],
-          shadowSize: [41, 41]
-        });
-
-        const currentMarker = L.marker([lat, lon], {
-          icon: redIcon,
-          opacity: 1.0,
-          zIndexOffset: 1000  // Place current marker on top of all historical markers
-        }).addTo(this._mapInstance);
-        allMarkers.push(currentMarker);
-
-        const lastSeen = entity.attributes.last_seen || 'Unknown';
-        const battery = entity.attributes.battery_level !== undefined ?
-          `${entity.attributes.battery_level}%` : 'Unknown';
-        const locationName = entity.attributes.location_name || 'Unknown location';
-
-        const currentTimestamp = new Date(lastSeen).toLocaleString();
-        const currentPopupContent = `
-          <div style="min-width: 200px;">
-            <b style="color: #dc3545;">📍 Current Location</b><br>
-            <b>Coordinates:</b> ${lat.toFixed(6)}, ${lon.toFixed(6)}<br>
-            <b>GPS Accuracy:</b> ${accuracy.toFixed(1)} meters<br>
-            <b>Timestamp:</b> ${currentTimestamp}<br>
-            <b style="color: #28a745;">Report Source:</b> <span style="color: #28a745;">📱 Own Device</span><br>
-            <b>Entity State:</b> ${entity.state || 'Unknown'}<br>
-          </div>
-        `;
-        currentMarker.bindPopup(currentPopupContent);
-
-        // Add current location accuracy circle in red
-        if (accuracy > 0) {
-          L.circle([lat, lon], {
-            radius: accuracy,
-            color: '#dc3545',
-            fillColor: '#dc3545',
-            fillOpacity: 0.1,
-            weight: 2,
-            opacity: 0.8
-          }).addTo(this._mapInstance);
-        }
-      } else {
-        // No history - just show current location with RED marker
-        const redIcon = L.icon({
-          iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
-          shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-          iconSize: [25, 41],
-          iconAnchor: [12, 41],
-          popupAnchor: [1, -34],
-          shadowSize: [41, 41]
-        });
-
-        const marker = L.marker([lat, lon], {
-          icon: redIcon,
-          zIndexOffset: 1000
-        }).addTo(this._mapInstance);
-        allMarkers.push(marker);
-
-        const lastSeen = entity.attributes.last_seen || 'Unknown';
-        const locationName = entity.attributes.location_name || 'Unknown location';
-
-        const noHistoryTimestamp = new Date(lastSeen).toLocaleString();
-        const popupContent = `
-          <div style="min-width: 200px;">
-            <b style="color: #dc3545;">📍 Current Location</b><br>
-            <b>Coordinates:</b> ${lat.toFixed(6)}, ${lon.toFixed(6)}<br>
-            <b>GPS Accuracy:</b> ${accuracy.toFixed(1)} meters<br>
-            <b>Timestamp:</b> ${noHistoryTimestamp}<br>
-            <b style="color: #28a745;">Report Source:</b> <span style="color: #28a745;">📱 Own Device</span><br>
-            <b>Entity State:</b> ${entity.state || 'Unknown'}<br>
-          </div>
-        `;
-
-        marker.bindPopup(popupContent).openPopup();
-
-        // Add accuracy circle in red
-        if (accuracy > 0) {
-          L.circle([lat, lon], {
-            radius: accuracy,
-            color: '#dc3545',
-            fillColor: '#dc3545',
-            fillOpacity: 0.1,
-            weight: 2,
-            opacity: 0.8
-          }).addTo(this._mapInstance);
-        }
-      }
-
-      // Always zoom to current device location at zoom level 15
-      this._mapInstance.setView([lat, lon], 15);
-    }, 100);
-  }
-
-  async _locateDevice(e, entityId) {
-    e.stopPropagation();
-    const deviceId = entityId.split('.')[1];
-    await this.hass.callService('googlefindmy', 'locate_device', {
-      device_id: deviceId
-    });
-  }
-
-  async _playSound(e, entityId) {
-    e.stopPropagation();
-    const deviceId = entityId.split('.')[1];
-    await this.hass.callService('googlefindmy', 'play_sound', {
-      device_id: deviceId
-    });
-  }
-
-  _openMap(e, entityId) {
-    e.stopPropagation();
-    const entity = this.hass.states[entityId];
-    if (entity && entity.attributes.configuration_url) {
-      window.open(entity.attributes.configuration_url, '_blank');
+      });
     }
   }
 
-  _handleMapError(entityId) {
-    console.warn(`Map failed to load for entity: ${entityId}`);
-    // Could show a toast notification or update the UI
-  }
+  if (!customElements.get(CARD_TAG)) customElements.define(CARD_TAG, GoogleFindMyCardTracker);
+  if (!customElements.get(EDITOR_TAG)) customElements.define(EDITOR_TAG, GoogleFindMyCardTrackerEditor);
 
-
-
-  async _refreshAll() {
-    // Trigger a coordinator update
-    await this.hass.callService('homeassistant', 'update_entity', {
-      entity_id: this.config.entities
-    });
-  }
-
-  static getConfigElement() {
-    return document.createElement("googlefindmy-card-editor");
-  }
-
-  static getStubConfig() {
-    return {
-      entities: [],
-      title: "Find My Devices",
-      show_last_seen: true,
-      show_location_name: true,
-      show_coordinates: true,
-      enable_actions: false,
-      keep_device_list_pinned: false,
-      show_path_lines: false,
-      use_leaflet_map: true,
-      filter_keywords: ""
-    };
-  }
-
-  static getLayoutOptions() {
-    return {
-      grid_columns: 4,
-      grid_rows: 4,
-      grid_min_columns: 2,
-      grid_min_rows: 3
-    };
-  }
-
-  getCardSize() {
-    // Return height based on configuration
-    return this.config?.card_size || 15;
-  }
-}
-
-// Only define if not already defined
-if (!customElements.get("googlefindmy-card")) {
-  customElements.define("googlefindmy-card", GoogleFindMyCard);
-}
-
-// Card Editor
-class GoogleFindMyCardEditor extends LitElement {
-  static get properties() {
-    return {
-      hass: { type: Object },
-      _config: { type: Object },
-      _helpers: { type: Object },
-    };
-  }
-
-  setConfig(config) {
-    this._config = config;
-    this.loadCardHelpers();
-  }
-
-  async loadCardHelpers() {
-    this._helpers = await window.loadCardHelpers();
-  }
-
-  static get styles() {
-    return css`
-      .option {
-        padding: 4px 0px;
-        cursor: pointer;
-      }
-      .row {
-        display: flex;
-        margin-bottom: -14px;
-        pointer-events: none;
-      }
-      .title {
-        padding-left: 16px;
-        margin-top: -6px;
-        pointer-events: none;
-      }
-      .secondary {
-        padding-left: 40px;
-        color: var(--secondary-text-color);
-        pointer-events: none;
-      }
-      .values {
-        padding-left: 16px;
-        background: var(--secondary-background-color);
-        display: grid;
-      }
-      ha-formfield {
-        padding: 8px 16px;
-      }
-      ha-textfield {
-        width: 100%;
-        display: block;
-      }
-    `;
-  }
-
-  render() {
-    if (!this.hass) {
-      return html`<div>Loading...</div>`;
-    }
-
-    const entities = this._getEntities();
-
-    return html`
-      <div class="card-config">
-        <div class="option">
-          <ha-textfield
-            label="Title (Optional)"
-            .value=${this._config.title || ""}
-            .configValue=${"title"}
-            @input=${this._valueChanged}
-          ></ha-textfield>
-        </div>
-
-        <div class="option">
-          <ha-textfield
-            label="Filter Keywords (comma separated)"
-            .value=${this._config.filter_keywords || ""}
-            .configValue=${"filter_keywords"}
-            @input=${this._valueChanged}
-          ></ha-textfield>
-          <div class="secondary">Keywords to filter device trackers (e.g. android,iphone,googlefindmy)</div>
-        </div>
-
-        <div class="option">
-          <div class="title">Device Entities</div>
-          <div class="secondary">Select Google Find My Device trackers to display</div>
-          <div class="values">
-            ${entities.map(entity => html`
-              <ha-formfield label=${entity.name}>
-                <ha-checkbox
-                  .checked=${this._config.entities?.includes(entity.entity_id)}
-                  .entityId=${entity.entity_id}
-                  @change=${this._entityToggled}
-                ></ha-checkbox>
-              </ha-formfield>
-            `)}
-          </div>
-        </div>
-
-        <div class="option">
-          <div class="title">Display Options</div>
-          <div class="values">
-
-
-            <ha-formfield label="Show Last Seen">
-              <ha-switch
-                .checked=${this._config.show_last_seen !== false}
-                .configValue=${"show_last_seen"}
-                @change=${this._valueChanged}
-              ></ha-switch>
-            </ha-formfield>
-
-            <ha-formfield label="Show Location Name">
-              <ha-switch
-                .checked=${this._config.show_location_name !== false}
-                .configValue=${"show_location_name"}
-                @change=${this._valueChanged}
-              ></ha-switch>
-            </ha-formfield>
-
-            <ha-formfield label="Show Coordinates">
-              <ha-switch
-                .checked=${this._config.show_coordinates === true}
-                .configValue=${"show_coordinates"}
-                @change=${this._valueChanged}
-              ></ha-switch>
-            </ha-formfield>
-
-            <ha-formfield label="Enable Actions">
-              <ha-switch
-                .checked=${this._config.enable_actions !== false}
-                .configValue=${"enable_actions"}
-                @change=${this._valueChanged}
-              ></ha-switch>
-            </ha-formfield>
-
-            <ha-formfield label="Keep Device List Pinned">
-              <ha-switch
-                .checked=${this._config.keep_device_list_pinned === true}
-                .configValue=${"keep_device_list_pinned"}
-                @change=${this._valueChanged}
-              ></ha-switch>
-            </ha-formfield>
-
-            <ha-formfield label="Show Path Lines (History)">
-              <ha-switch
-                .checked=${this._config.show_path_lines !== false}
-                .configValue=${"show_path_lines"}
-                @change=${this._valueChanged}
-              ></ha-switch>
-            </ha-formfield>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  _getEntities() {
-    const entities = [];
-    Object.keys(this.hass.states).forEach(key => {
-      if (key.startsWith("device_tracker.")) {
-        const entity = this.hass.states[key];
-        const attributes = entity.attributes;
-
-        // Filter for GPS-based device trackers
-        const filterKeywords = (this._config?.filter_keywords || "")
-          .split(",")
-          .map(k => k.trim().toLowerCase())
-          .filter(k => k.length > 0);
-
-        const matchesKeyword = filterKeywords.length === 0 || filterKeywords.some(keyword =>
-          key.toLowerCase().includes(keyword)
-        );
-
-        const isGpsDevice = attributes.source_type === "gps" || attributes.latitude !== undefined;
-
-        // Include GPS devices that match the filter keywords (or all GPS if filter is blank)
-        if (isGpsDevice && matchesKeyword) {
-          entities.push({
-            entity_id: key,
-            name: attributes.friendly_name || key
-          });
-        }
-      }
-    });
-    return entities;
-  }
-
-  _valueChanged(ev) {
-    if (!this._config) return;
-    const target = ev.target;
-    const configValue = target.configValue;
-
-    if (configValue) {
-      if (target.checked !== undefined) {
-        this._config = {
-          ...this._config,
-          [configValue]: target.checked,
-        };
-      } else {
-        this._config = {
-          ...this._config,
-          [configValue]: target.value,
-        };
-      }
-    }
-
-    const event = new CustomEvent("config-changed", {
-      detail: { config: this._config },
-      bubbles: true,
-      composed: true,
-    });
-    this.dispatchEvent(event);
-
-    // Force re-render when filter keywords change to update entity list
-    if (configValue === "filter_keywords") {
-      this.requestUpdate();
-    }
-  }
-
-  _entityToggled(ev) {
-    ev.stopPropagation();
-    const entityId = ev.target.entityId;
-    const checked = ev.target.checked;
-    let entities = [...(this._config.entities || [])];
-
-    if (checked && !entities.includes(entityId)) {
-      entities.push(entityId);
-    } else if (!checked) {
-      entities = entities.filter(e => e !== entityId);
-    }
-
-    // Create new config object
-    const newConfig = {
-      ...this._config,
-      entities,
-    };
-
-    // Update internal config
-    this._config = newConfig;
-
-    // Fire config-changed event
-    const event = new CustomEvent("config-changed", {
-      detail: { config: newConfig },
-      bubbles: true,
-      composed: true,
-    });
-    this.dispatchEvent(event);
-
-    // Force re-render of editor
-    this.requestUpdate();
-  }
-}
-
-// Only define if not already defined
-if (!customElements.get("googlefindmy-card-editor")) {
-  customElements.define("googlefindmy-card-editor", GoogleFindMyCardEditor);
-}
-
-// Register the card (only once)
-window.customCards = window.customCards || [];
-if (!window.customCards.find(card => card.type === "googlefindmy-card")) {
+  window.customCards = window.customCards || [];
   window.customCards.push({
-    type: "googlefindmy-card",
-    name: "Google Find My Device Card",
-    description: "A custom card for Google Find My Device integration with map support and device actions",
+    type: CARD_TAG,
+    name: "Google FindMy Card Tracker",
+    description:
+      "Mapa interactivo para Google Find My Device con inicio/fin, marcadores numerados, flechas de dirección, reproducción del recorrido, estadísticas y exportación GPX/KML.",
     preview: true,
-    documentationURL: "https://github.com/BSkando/GoogleFindMy-Card"
+    documentationURL: "https://github.com/davicho16/googlefindmy-card-tracker",
   });
-}
 
-console.info(
-  `%c GOOGLE-FINDMY-CARD %c Version 1.1.0 `,
-  'color: white; font-weight: bold; background: #1a73e8',
-  'color: #1a73e8; font-weight: bold; background: #f0f0f0'
-);
+  console.info(
+    `%c GOOGLEFINDMY-CARD-TRACKER %c v${CARD_VERSION} `,
+    "color: white; background: #2196f3; font-weight: 700;",
+    "color: #2196f3; background: white; font-weight: 700;"
+  );
+})();
